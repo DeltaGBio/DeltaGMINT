@@ -1,0 +1,86 @@
+# Ignore all the models
+*.ckpt
+*.pth
+*.pt
+*.pkl
+*.json
+*.csv
+*.txt
+*.log
+*.npz
+
+
+
+# Ignore all the logs
+logs/*
+
+# Ignore all the results
+results/*
+
+# Ignore all the datasets
+datasets/*
+
+# Ignore all the text files
+*.txt
+
+# Ignore all the csv files
+*.csv
+
+# Ignore all output pdb files
+*.pdb
+*.trb
+*.pdb.gz
+
+
+
+# Ignore apptainer images
+*.sif
+*.simg
+*.img
+*.tar
+*.tar.gz
+*.tar.bz2
+
+# Ignore all the images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+
+# Ignore all the logs 
+*.err
+*.out
+*.log
+*.log.gz
+*.log.bz2
+*.log.xz
+*.log.tar
+
+
+# Ignore all the logs  from wandb
+wandb/*
+
+# Ignore all the logs  from wandb
+wandb/*
+
+#dataset
+*.csv
+*.tsv
+*.json
+*.pkl
+*.pt
+*.pth
+*.yaml
+*.json
+*.wandb
+*.pkl
+
+#python cache
+__pycache__/*
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz

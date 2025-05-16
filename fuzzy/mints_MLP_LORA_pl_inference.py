@@ -1,0 +1,476 @@
+import os, random, json, math, time, argparse, re
+from collections import OrderedDict
+from datetime import datetime
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Subset
+import lightning.pytorch as pl
+from lightning.pytorch.strategies import DDPStrategy
+from sklearn.metrics import r2_score
+from scipy.stats import pearsonr
+
+import mint
+from mint.model.esm2 import ESM2
+from peft import get_peft_model, LoraConfig
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ----------------------------
+# Configuration
+# ----------------------------
+class CFG:
+    """Global config for training and model."""
+    EPOCHS = 1000
+    BATCH_SIZE = 32
+    LR = 1e-3
+    WD = 1e-6
+    SEED = 2024
+    EMBED_DIM = 1280
+    OUTPUT_DIM = 1
+    RANK = 16
+
+# ----------------------------
+# Collate function for mutational PPI
+# ----------------------------
+class MutationalPPICollateFn:
+    """Collate function for mutational PPI batches."""
+    def __init__(self, truncation_seq_length=None):
+        self.alphabet = mint.data.Alphabet.from_architecture("ESM-1b")
+        self.truncation_seq_length = truncation_seq_length
+
+    def __call__(self, batches):
+        wt_ab, wt_ag, mut_ab, mut_ag, labels = zip(*batches)
+        wt_chains = [self.convert(c) for c in [wt_ab, wt_ag]]
+        wt_chain_ids = [
+            torch.ones(c.shape, dtype=torch.int32) * i for i, c in enumerate(wt_chains)
+        ]
+        wt_chains = torch.cat(wt_chains, -1)
+        wt_chain_ids = torch.cat(wt_chain_ids, -1)
+        mut_chains = [self.convert(c) for c in [mut_ab, mut_ag]]
+        mut_chain_ids = [
+            torch.ones(c.shape, dtype=torch.int32) * i for i, c in enumerate(mut_chains)
+        ]
+        mut_chains = torch.cat(mut_chains, -1)
+        mut_chain_ids = torch.cat(mut_chain_ids, -1)
+        labels = torch.from_numpy(np.stack(labels, 0))
+        return wt_chains, wt_chain_ids, mut_chains, mut_chain_ids, labels
+
+    def convert(self, seq_str_list):
+        """Tokenize and pad a list of sequence strings."""
+        batch_size = len(seq_str_list)
+        seq_encoded_list = [
+            self.alphabet.encode("<cls>" + seq_str.replace("J", "L") + "<eos>")
+            for seq_str in seq_str_list
+        ]
+        if self.truncation_seq_length:
+            for i in range(batch_size):
+                seq = seq_encoded_list[i]
+                if len(seq) > self.truncation_seq_length:
+                    start = random.randint(0, len(seq) - self.truncation_seq_length + 1)
+                    seq_encoded_list[i] = seq[start:start + self.truncation_seq_length]
+        max_len = max(len(seq_encoded) for seq_encoded in seq_encoded_list)
+        if self.truncation_seq_length:
+            assert max_len <= self.truncation_seq_length
+        tokens = torch.empty((batch_size, max_len), dtype=torch.int64)
+        tokens.fill_(self.alphabet.padding_idx)
+        for i, seq_encoded in enumerate(seq_encoded_list):
+            seq = torch.tensor(seq_encoded, dtype=torch.int64)
+            tokens[i, :len(seq_encoded)] = seq
+        return tokens
+
+# ----------------------------
+# Dataset & Collate Function
+# ----------------------------
+class ProteinSequenceDataset(Dataset):
+    """Dataset for protein sequence pairs and targets from CSV."""
+    def __init__(self, df_path, col1, col2, col3, col4, target_col, test_run=False):
+        super().__init__()
+        self.df = pd.read_csv(df_path)
+        if test_run:
+            self.df = self.df.sample(n=101)
+        self.seqs1 = self.df[col1].tolist()
+        self.seqs2 = self.df[col2].tolist()
+        self.seqs3 = self.df[col3].tolist()
+        self.seqs4 = self.df[col4].tolist()
+        if isinstance(target_col, list):
+            self.targets = self.df[target_col].to_numpy()
+        else:
+            self.targets = self.df[target_col].tolist()
+
+    def __len__(self):
+        return len(self.seqs1)
+
+    def __getitem__(self, index):
+        return (
+            self.seqs1[index],
+            self.seqs2[index],
+            self.seqs3[index],
+            self.seqs4[index],
+            self.targets[index],
+        )
+
+# ----------------------------
+# Sequence Embedder
+# ----------------------------
+class SequenceEmbedder(nn.Module):
+    """ESM2-based sequence embedder for paired chains."""
+    def __init__(
+        self, cfg, checkpoint_path, freeze_percent=0.0, use_multimer=True, sep_chains=True, device="cuda:0"
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.sep_chains = sep_chains
+        self.model = ESM2(
+            num_layers=cfg.encoder_layers,
+            embed_dim=cfg.encoder_embed_dim,
+            attention_heads=cfg.encoder_attention_heads,
+            token_dropout=cfg.token_dropout,
+            use_multimer=use_multimer,
+        )
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        if use_multimer:
+            new_checkpoint = OrderedDict((key.replace("model.", ""), value) for key, value in checkpoint["state_dict"].items())
+            self.model.load_state_dict(new_checkpoint)
+        else:
+            def upgrade_state_dict(state_dict):
+                prefixes = ["encoder.sentence_encoder.", "encoder."]
+                pattern = re.compile("^" + "|".join(prefixes))
+                return {pattern.sub("", name): param for name, param in state_dict.items()}
+            new_checkpoint = upgrade_state_dict(checkpoint["model"])
+            self.model.load_state_dict(new_checkpoint)
+        total_layers = cfg.encoder_layers
+        for name, param in self.model.named_parameters():
+            if ("embed_tokens.weight" in name or "_norm_after" in name or "lm_head" in name):
+                param.requires_grad = False
+            else:
+                layer_num = name.split(".")[1]
+                if int(layer_num) <= math.floor(total_layers * freeze_percent):
+                    param.requires_grad = False
+
+    def get_one_chain(self, chain_out, mask_expanded, mask):
+        """Mean pooling over masked positions for a chain."""
+        masked_chain_out = chain_out * mask_expanded
+        sum_masked = masked_chain_out.sum(dim=1)
+        mask_counts = mask.sum(dim=1, keepdim=True).float()
+        mean_chain_out = sum_masked / mask_counts
+        return mean_chain_out
+
+    def forward_one(self, chains, chain_ids):
+        """Embed a single wildtype or mutant chain pair."""
+        mask = ((~chains.eq(self.model.cls_idx)) & (~chains.eq(self.model.eos_idx)) & (~chains.eq(self.model.padding_idx)))
+        chain_out = self.model(chains, chain_ids, repr_layers=[33])["representations"][33]
+        if self.sep_chains:
+            mask_chain_0 = (chain_ids.eq(0) & mask).unsqueeze(-1).expand_as(chain_out)
+            mask_chain_1 = (chain_ids.eq(1) & mask).unsqueeze(-1).expand_as(chain_out)
+            mean_chain_out_0 = self.get_one_chain(chain_out, mask_chain_0, (chain_ids.eq(0) & mask))
+            mean_chain_out_1 = self.get_one_chain(chain_out, mask_chain_1, (chain_ids.eq(1) & mask))
+            return torch.cat((mean_chain_out_0, mean_chain_out_1), -1)
+        else:
+            mask_expanded = mask.unsqueeze(-1).expand_as(chain_out)
+            masked_chain_out = chain_out * mask_expanded
+            sum_masked = masked_chain_out.sum(dim=1)
+            mask_counts = mask.sum(dim=1, keepdim=True).float()
+            mean_chain_out = sum_masked / mask_counts
+            return mean_chain_out
+
+    def forward(self, wt_chains, wt_chain_ids, mut_chains, mut_chain_ids, cat=False):
+        """Embed wildtype and mutant, return difference or concat."""
+        wt_chains_out = self.forward_one(wt_chains, wt_chain_ids)
+        mut_chains_out = self.forward_one(mut_chains, mut_chain_ids)
+        if cat:
+            return torch.cat((wt_chains_out, mut_chains_out), -1)
+        return wt_chains_out - mut_chains_out
+
+@torch.no_grad()
+def get_embeddings_two(model, loader, device, cat):
+    """Extract embeddings and targets from loader using model."""
+    embeddings = []
+    targets = []
+    for _, eval_batch in enumerate(loader):
+        wt_chains, wt_chain_ids, mut_chains, mut_chain_ids, target = eval_batch
+        wt_chains = wt_chains.to(device)
+        wt_chain_ids = wt_chain_ids.to(device)
+        mut_chains = mut_chains.to(device)
+        mut_chain_ids = mut_chain_ids.to(device)
+        embedding = model(wt_chains, wt_chain_ids, mut_chains, mut_chain_ids, cat)
+        embeddings.append(embedding.detach().cpu())
+        targets.append(target)
+    embeddings = torch.cat(embeddings)
+    targets = torch.cat(targets)
+    targets = targets.reshape(-1, 1)
+    return embeddings, targets
+
+# ----------------------------
+# MLP Head Definition
+# ----------------------------
+class MLP(nn.Module):
+    """Multi-layer perceptron regression head."""
+    def __init__(self, input_dim=CFG.EMBED_DIM, output_dim=CFG.OUTPUT_DIM, lr=CFG.LR, weight_decay=CFG.WD):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.fc1 = nn.Linear(self.input_dim, 1024)
+        self.fc2 = nn.Linear(1024, 512)
+        self.dropout = nn.Dropout(0.1)
+        self.fc3 = nn.Linear(512, 256)
+        self.output = nn.Linear(256, self.output_dim)
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        """Xavier initialization for all linear layers."""
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv1d)):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = x.float()
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.dropout(x)
+        x = F.relu(self.fc3(x))
+        x = self.dropout(x)
+        x = self.output(x)
+        return x
+
+# ----------------------------
+# Combined Model
+# ----------------------------
+class CombinedModel(nn.Module):
+    """Model: embedder + MLP head for regression."""
+    def __init__(self, embedder, mlp):
+        super().__init__()
+        self.embedder = embedder
+        self.mlp = mlp
+
+    def forward(self, wt_chains, wt_chain_ids, mut_chains, mut_chain_ids):
+        embeddings = self.embedder(wt_chains, wt_chain_ids, mut_chains, mut_chain_ids)
+        output = self.mlp(embeddings)
+        return output
+
+# ----------------------------
+# Lightning Module for Inference
+# ----------------------------
+class DeltaGLightningModule(pl.LightningModule):
+    """LightningModule for DeltaG regression using CombinedModel."""
+    def __init__(self, model, loss_fn, lr, weight_decay=CFG.WD, gamma=0.95):
+        super().__init__()
+        self.model = model
+        self.loss_fn = loss_fn
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.gamma = gamma
+
+    def forward(self, wt_chains, wt_chain_ids, mut_chains, mut_chain_ids):
+        return self.model(wt_chains, wt_chain_ids, mut_chains, mut_chain_ids)
+
+    def predict_step(self, batch, batch_idx: int, dataloader_idx: int = 0):
+        # Unpack the batch (the fifth element is the target which is not needed during inference)
+        wt_chains, wt_chain_ids, mut_chains, mut_chain_ids, _ = batch
+        return self.forward(wt_chains, wt_chain_ids, mut_chains, mut_chain_ids)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=self.gamma)
+        return [optimizer], [{'scheduler': scheduler, 'interval': 'epoch'}]
+
+# ----------------------------
+# Main Inference Function
+# ----------------------------
+
+def main(args):
+    """Inference mode: Load model checkpoint and run predictions."""
+    torch.manual_seed(CFG.SEED)
+    np.random.seed(CFG.SEED)
+    random.seed(CFG.SEED)
+    
+    # Set up results directory with timestamp
+    current_date = datetime.now()
+    date_string = current_date.strftime("%Y%m%d_%H%M")
+    results_dir = f"{args.results_dir}/{date_string}/"
+    os.makedirs(results_dir, exist_ok=True)
+
+
+    # Load configuration from JSON
+    CONFIG_DICT_PATH = "/pasteur/appa/scratch/dvu/github/mint/data/esm2_t33_650M_UR50D.json"
+    cfg = argparse.Namespace()
+    with open(CONFIG_DICT_PATH) as f:
+        cfg.__dict__.update(json.load(f))
+
+    # Expect the CSV for inference (should contain sequences and optionally targets)
+    train_fl = args.csv_file
+    col1 = "seq1"
+    col2 = "seq2"
+    mut_col1 = "seq1_mut"
+    mut_col2 = "seq2_mut"
+    target_col = "target"
+    
+    # Create dataset and dataloader for inference
+    dataset = ProteinSequenceDataset(
+        df_path=train_fl,
+        col1=col1,
+        col2=col2,
+        col3=mut_col1,
+        col4=mut_col2,
+        target_col=target_col
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=CFG.BATCH_SIZE,
+        shuffle=False,
+        collate_fn=MutationalPPICollateFn(),
+        num_workers=7
+    )
+    
+    # Initialize embedder
+    embedder = SequenceEmbedder(
+        cfg,
+        args.checkpoint_path,
+        freeze_percent=1.0,
+        use_multimer=True,
+        sep_chains=args.sep_chains,
+        device=device
+    )
+    
+    if args.use_lora:
+        lora_config = LoraConfig(
+            r=CFG.RANK,
+            lora_alpha=1,
+            lora_dropout=0.1,
+            bias="none",
+            target_modules=["query", "key", "value", "dense"]
+        )
+        embedder.model = get_peft_model(embedder.model, lora_config)
+        print("LoRA fine-tuning enabled. Trainable parameters:")
+        print(embedder.model.print_trainable_parameters())
+    
+    # Initialize MLP head
+    mlp_head = MLP(
+        input_dim=CFG.EMBED_DIM,
+        output_dim=CFG.OUTPUT_DIM,
+        lr=CFG.LR,
+        weight_decay=CFG.WD
+    )
+    
+    # Initialize combined model
+    model = CombinedModel(embedder, mlp_head)
+    model = model.to(device)
+    loss_fn = torch.nn.HuberLoss()
+
+    # Load the trained LightningModule checkpoint
+    lightning_model = DeltaGLightningModule.load_from_checkpoint(
+        checkpoint_path=args.inference_checkpoint,
+        model=model,
+        loss_fn=loss_fn,
+        lr=CFG.LR,
+        weight_decay=CFG.WD,
+        gamma=0.95
+    )
+    lightning_model.eval()
+
+    # Create a Trainer for inference
+    trainer = pl.Trainer(
+        accelerator='auto',
+        strategy=DDPStrategy(find_unused_parameters=True),
+        logger=False
+    )
+
+    # Run inference using trainer.predict
+    predictions = trainer.predict(lightning_model, dataloaders=dataloader)
+
+    # predictions is a list of outputs from the forward pass
+    preds_list = []
+    for pred in predictions:
+        # Each 'pred' can be a tensor from the forward pass
+        preds_list.append(pred)
+    all_preds = torch.cat(preds_list, dim=0)
+
+    # If ground truth targets are available in the dataset, compute metrics
+    all_targets = []
+    for item in dataset:
+        # item = (seq1, seq2, seq1_mut, seq2_mut, target)
+        all_targets.append(item[4])
+    all_targets = torch.tensor(all_targets).float().view(-1, 1)
+
+    preds_np = all_preds.detach().cpu().numpy()
+    targets_np = all_targets.detach().cpu().numpy()
+
+    r2 = r2_score(targets_np[:, 0], preds_np[:, 0])
+    pearson = pearsonr(targets_np[:, 0], preds_np[:, 0])[0]
+    print(f"Inference metrics: R2: {r2:.2f}, Pearson: {pearson:.2f}")
+
+    # Plot regression scatter plot
+    fig, ax = plt.subplots(figsize=(5, 5))
+    sns.regplot(
+        x=targets_np[:, 0],
+        y=preds_np[:, 0],
+        ax=ax,
+        color="tab:blue",
+        line_kws={"label": "Regression Line"},
+        scatter_kws={"alpha": 0.5, "s": 5}
+    )
+    ax.set_xlabel("True Values")
+    ax.set_ylabel("Predicted Values")
+    ax.set_title(f"Inference | R2: {r2:.2f} | Pearson: {pearson:.2f}")
+    plt.tight_layout()
+    plt.savefig(f"{results_dir}/inference_scatter.png")
+    plt.close()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--csv_file",
+        type=str,
+        required=True,
+        help="Path to CSV file containing sequences (and targets) for inference",
+    )
+
+    parser.add_argument(
+        "--results_dir",
+        type=str,
+        default="inference",
+        help="Path to results directory",
+    )
+
+    parser.add_argument(
+        "--inference_checkpoint",
+        type=str,
+        required=True,
+        help="Path to the trained LightningModule checkpoint for inference",
+    )
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default="/pasteur/appa/scratch/dvu/github/mint/models/mint.ckpt",
+        help="Path to MINT model checkpoint",
+    )
+    parser.add_argument(
+        "--sep_chains",
+        type=bool,
+        default=False,
+        help="Whether to separate chains",
+    )
+    parser.add_argument(
+        "--cat",
+        type=bool,
+        default=False,
+        help="Whether to concatenate embeddings",
+    )
+    parser.add_argument(
+        "--use_lora",
+        action="store_true",
+        default=True,
+        help="Enable LoRA fine-tuning on the embedding model",
+    )
+    args = parser.parse_args()
+    main(args) 
