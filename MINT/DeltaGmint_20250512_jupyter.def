@@ -35,20 +35,26 @@ From: nvidia/cuda:12.4.0-devel-ubuntu22.04
     pip install lightning seaborn tqdm plotly peft importlib_metadata scipy
     pip install --upgrade wandb
     pip install scikit-learn==1.0.2
+    pip install \
+        jupyter \
+        jupyterlab-spellchecker \
+        jupyterlab-git \
+        jupyterlab-lsp \
     
     # Verify the conda environment installation
     conda list -n mint
     
 
 %files
+    # Copy all files and directories from the build context into the image
     . .
 
 %environment
   export MINIFORGE3_ROOT="/usr/local/apps/pyenv/versions/miniforge3-23.11.0-0"
   export mint="${MINIFORGE3_ROOT}/envs/mint"
   export PATH="${mint}/bin:${PATH}"
-  
+  export JUPYTERLAB_PORT=54321
+
 
 %runscript
-  # Pass all arguments to the underlying executable.
-  "$@"
+  exec jupyter lab --no-browser --ip 0.0.0.0 --port $JUPYTERLAB_PORT

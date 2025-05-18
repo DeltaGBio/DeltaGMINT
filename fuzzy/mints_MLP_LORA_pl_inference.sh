@@ -9,7 +9,7 @@
 export SSL_CERT_FILE=/pasteur/appa/homes/dvu/cacert.pem
 module load apptainer
 sif_path="/pasteur/appa/scratch/dvu/github/DeltaGMINT/MINT/DeltaGmint_20250513.sif"
-model="/pasteur/appa/scratch/dvu/github/DeltaGMINT/fuzzy/training/20250515_1753/epoch_epoch=15_model.ckpt"
+model="/pasteur/appa/scratch/dvu/github/DeltaGMINT/fuzzy/training/20250515_2232/epoch_epoch=14_model.ckpt"
 test_data="/pasteur/appa/scratch/dvu/github/DeltaGMINT/fuzzy/datasets/criptc_norm_for_mochi_balanced_exp10_processed_MINT_test.csv"
 apptainer exec --nv -B /local -B /pasteur $sif_path bash -c "python mints_MLP_LORA_pl_inference.py --use_lora --inference_checkpoint $model --csv_file $test_data"
 

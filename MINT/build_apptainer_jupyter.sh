@@ -9,4 +9,4 @@
 module load apptainer
 
 
-apptainer build ../apptainer/DeltaGmint_20250512.sif DeltaGmint_20250512.def
+apptainer build ../apptainer/DeltaGmint_20250512_jupyter.sif DeltaGmint_20250512_jupyter.def

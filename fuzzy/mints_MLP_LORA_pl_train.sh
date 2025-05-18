@@ -10,7 +10,7 @@
 export SSL_CERT_FILE=/pasteur/appa/homes/dvu/cacert.pem
 module load apptainer
 sif_path="/pasteur/appa/scratch/dvu/github/DeltaGMINT/MINT/DeltaGmint_20250513.sif"
-train_data="/pasteur/appa/scratch/dvu/github/DeltaGMINT/fuzzy/datasets/criptc_norm_for_mochi_balanced_exp10_processed_MINT_train.csv"
-test_data="/pasteur/appa/scratch/dvu/github/DeltaGMINT/fuzzy/datasets/criptc_norm_for_mochi_balanced_exp10_processed_MINT_test.csv"
+train_data="/pasteur/appa/scratch/dvu/github/DeltaGMINT/fuzzy/datasets/criptc_norm_for_mochi_processed_MINT_train.csv"
+test_data="/pasteur/appa/scratch/dvu/github/DeltaGMINT/fuzzy/datasets/criptc_norm_for_mochi_processed_MINT_test.csv"
 apptainer exec --nv -B /local -B /pasteur $sif_path bash -c "python mints_MLP_LORA_pl_train.py --use_lora --train_set $train_data --test_set $test_data"
 
